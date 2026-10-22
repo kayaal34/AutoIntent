@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import time
 from textwrap import dedent
 from typing import TYPE_CHECKING, Any, TypedDict, TypeVar
 
@@ -34,6 +36,70 @@ class GeneratorDumpData(TypedDict):
     model_name: str
     base_url: str | None
     generation_params: dict[str, Any]
+
+
+FATAL_STATUS_CODES = frozenset({400, 401, 402, 403, 404, 405, 422})
+"""HTTP statuses that retrying cannot fix: bad request, auth, permissions, missing model, no credits."""
+
+_INITIAL_RETRY_DELAY = 1.0
+_MAX_RETRY_DELAY = 60.0
+
+
+class FatalAPIError(RuntimeError):
+    """Exception raised when the API rejects a request in a way that retrying cannot fix.
+
+    Raised instead of retrying so that a misconfigured key, model or exhausted budget
+    fails immediately with a readable message rather than after spending more calls.
+    """
+
+    def __init__(self, status_code: int, detail: str) -> None:
+        """Initialize the error with the HTTP status and the message reported by the API.
+
+        Args:
+            status_code: HTTP status code returned by the API
+            detail: Error message as reported by the API
+        """
+        msg = f"The API returned HTTP {status_code}, which retrying cannot fix: {detail}"
+        super().__init__(msg)
+        self.status_code = status_code
+
+
+def _raise_if_fatal(error: Exception) -> None:
+    """Re-raise an API error as :py:class:`FatalAPIError` if retrying it would be pointless.
+
+    Args:
+        error: Exception raised by the OpenAI client.
+
+    Raises:
+        FatalAPIError: If the API answered with one of :py:data:`FATAL_STATUS_CODES`.
+    """
+    from openai import APIStatusError
+
+    if isinstance(error, APIStatusError) and error.status_code in FATAL_STATUS_CODES:
+        raise FatalAPIError(error.status_code, str(error)) from error
+
+
+def _retry_delay(error: Exception, attempt: int) -> float:
+    """Seconds to wait before the next attempt, honouring ``Retry-After`` when the API sends it.
+
+    Args:
+        error: Exception raised by the OpenAI client.
+        attempt: Zero-based index of the attempt that just failed.
+
+    Returns:
+        Delay in seconds, capped at one minute.
+    """
+    from openai import APIStatusError
+
+    if isinstance(error, APIStatusError):
+        retry_after = error.response.headers.get("retry-after")
+        if retry_after is not None:
+            try:
+                return min(float(retry_after), _MAX_RETRY_DELAY)
+            except ValueError:
+                # Retry-After may also be an HTTP date; fall back to the backoff below.
+                logger.debug("Could not read Retry-After value %r as seconds", retry_after)
+    return min(_INITIAL_RETRY_DELAY * 2.0**attempt, _MAX_RETRY_DELAY)
 
 
 class RetriesExceededError(RuntimeError):
@@ -272,8 +338,17 @@ class Generator:
         current_messages = messages.copy()
         res: T | None = None
 
-        for _ in range(max_retries + 1):
-            res, error, raw = await self._get_structured_output_openai_async(current_messages, output_model)
+        from openai import APIConnectionError, APIStatusError
+
+        for attempt in range(max_retries + 1):
+            try:
+                res, error, raw = await self._get_structured_output_openai_async(current_messages, output_model)
+            except (APIConnectionError, APIStatusError) as e:
+                _raise_if_fatal(e)
+                delay = _retry_delay(e, attempt)
+                logger.warning("API call failed (%s), retrying in %.1fs", e, delay)
+                await asyncio.sleep(delay)
+                continue
 
             if res is not None:
                 break
@@ -359,8 +434,17 @@ class Generator:
         current_messages = messages.copy()
         res: T | None = None
 
-        for _ in range(max_retries + 1):
-            res, error, raw = self._get_structured_output_openai_sync(current_messages, output_model)
+        from openai import APIConnectionError, APIStatusError
+
+        for attempt in range(max_retries + 1):
+            try:
+                res, error, raw = self._get_structured_output_openai_sync(current_messages, output_model)
+            except (APIConnectionError, APIStatusError) as e:
+                _raise_if_fatal(e)
+                delay = _retry_delay(e, attempt)
+                logger.warning("API call failed (%s), retrying in %.1fs", e, delay)
+                time.sleep(delay)
+                continue
 
             if res is not None:
                 break

@@ -4,6 +4,6 @@ See :ref:`data-aug-tuts`.
 """
 
 from ._cache import StructuredOutputCache
-from ._generator import Generator, RetriesExceededError
+from ._generator import FatalAPIError, Generator, RetriesExceededError
 
-__all__ = ["Generator", "RetriesExceededError"]
+__all__ = ["FatalAPIError", "Generator", "RetriesExceededError"]
